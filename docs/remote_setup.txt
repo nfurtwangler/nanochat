@@ -1,11 +1,12 @@
 git clone https://github.com/nfurtwangler/nanochat.git
 cd nanochat
+git switch partial_collapse
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ~/.local/bin/uv venv
 source .venv/bin/activate
 ~/.local/bin/uv sync --extra gpu
 wandb login
-[export GLT_MEM_DEBUG=1]
+
 WANDB_RUN=RunBaseline1 bash run10.sh --gpu 5090|a100 --glt --viz_enabled=True --viz_scalar_every=20 --viz_hist_every=200 --glt_offsets="[-1,0,1]" --glt_ce_chunk 2 [--glt_no_geom]
 
-WANDB_RUN=RunBaseline1 bash run10.sh --gpu 5090
+WANDB_RUN=RunBaseA100 bash run10.sh --gpu a100
