@@ -104,8 +104,10 @@ BASE_DESC="~260M params (depth 12), ~520M tokens"
 
 if [[ "$GPU_TYPE" == "5090" ]]; then
     BASE_DEPTH=28
-    BASE_DEVICE_BATCH=4
+    BASE_DEVICE_BATCH=3
+    BASE_TOTAL_BATCH=129024
     BASE_ITERS=500
+    BASE_EVAL_TOKENS=294912
     BASE_DESC="~1.3B params (depth 28), ~65M tokens (~same FLOPs as depth-12 run)"
 fi
 
@@ -117,7 +119,7 @@ python -m scripts.base_train \
     --device_batch_size=$BASE_DEVICE_BATCH \
     --total_batch_size=$BASE_TOTAL_BATCH \
     --num_iterations=$BASE_ITERS \
-    --eval_every=300 \
+    --eval_every=200 \
     --eval_tokens=$BASE_EVAL_TOKENS \
     --core_metric_every=-1 \
     --sample_every=-1 \

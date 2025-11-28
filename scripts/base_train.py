@@ -12,7 +12,9 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+alloc_conf = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 import time
 from contextlib import nullcontext
 
@@ -344,7 +346,7 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 100 == 0:
+    if step % 20 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
