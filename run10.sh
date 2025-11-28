@@ -1,16 +1,29 @@
 #!/bin/bash
+set -euo pipefail
 
 # The ~$10 tier of nanochat.
-# Supports `--gpu=a100` (default, 80GB) and `--gpu=5090` (32GB). Both follow the
-# same training recipe (depth 12), but the 5090 path lowers device batch sizes
-# so it fits the smaller VRAM footprint while keeping total batch size constant.
+# Supports `--gpu=a100` (default, 80GB) and `--gpu=5090` (32GB). The a100 config
+# stays on the ~260M parameter depth-12 recipe, while the 5090 path now scales up
+# model depth to better use VRAM (with fewer iterations to keep the cost in check).
 # Budget target: ~12 hours of uninterrupted run time on the chosen GPU (~$10).
 
 GPU_TYPE="a100"
-for arg in "$@"; do
-    case $arg in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --gpu=*)
-            GPU_TYPE="${arg#*=}"
+            GPU_TYPE="${1#*=}"
+            shift
+            ;;
+        --gpu)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --gpu" >&2
+                exit 1
+            fi
+            GPU_TYPE="$2"
+            shift 2
+            ;;
+        *)
+            shift
             ;;
     esac
 done
@@ -23,6 +36,9 @@ fi
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
+BASE_DATA_DIR="$NANOCHAT_BASE_DIR/base_data"
+TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer"
+DATASET_DOWNLOAD_PID=""
 
 # -----------------------------------------------------------------------------
 # Environment + dependencies
@@ -47,30 +63,54 @@ curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-publ
 # -----------------------------------------------------------------------------
 # Tokenizer + data (moderate scale)
 
-# Grab enough shards for ~450M tokens of training and keep downloading extras
-python -m nanochat.dataset -n 4
-python -m nanochat.dataset -n 80 &
-DATASET_DOWNLOAD_PID=$!
+# Grab enough shards for the first few hundred million training tokens and keep downloading extras
+DATASET_READY=0
+if [[ -d "$BASE_DATA_DIR" ]]; then
+    if find "$BASE_DATA_DIR" -maxdepth 1 -name 'shard_*.parquet' -print -quit | grep -q .; then
+        DATASET_READY=1
+    fi
+fi
+
+if [[ $DATASET_READY -eq 1 ]]; then
+    echo "Found dataset shards in $BASE_DATA_DIR, skipping download."
+else
+    python -m nanochat.dataset -n 8
+    python -m nanochat.dataset -n 160 &
+    DATASET_DOWNLOAD_PID=$!
+fi
 
 # Train tokenizer on ~1B characters (still finishes quickly on A100 boxes)
-python -m scripts.tok_train --max_chars=1000000000
-python -m scripts.tok_eval
+if [[ -f "$TOKENIZER_DIR/tokenizer.pkl" && -f "$TOKENIZER_DIR/token_bytes.pt" ]]; then
+    echo "Found tokenizer artifacts in $TOKENIZER_DIR, skipping tokenizer train/eval."
+else
+    python -m scripts.tok_train --max_chars=1000000000
+    python -m scripts.tok_eval
+fi
 
-echo "Waiting for dataset background download to finish..."
-wait $DATASET_DOWNLOAD_PID
+if [[ -n "$DATASET_DOWNLOAD_PID" ]]; then
+    echo "Waiting for dataset background download to finish..."
+    wait $DATASET_DOWNLOAD_PID
+fi
 
 # -----------------------------------------------------------------------------
-# Base model (~260M params at depth 12, ~520M tokens of training)
+# Base model (scales depth/iterations per GPU target)
 
 BASE_DEPTH=12
-if [[ "$GPU_TYPE" == "5090" ]]; then
-    BASE_DEVICE_BATCH=2
-else
-    BASE_DEVICE_BATCH=8
-fi
+BASE_DEVICE_BATCH=8
 BASE_TOTAL_BATCH=131072
 BASE_ITERS=4000
 BASE_EVAL_TOKENS=262144
+BASE_DESC="~260M params (depth 12), ~520M tokens"
+
+if [[ "$GPU_TYPE" == "5090" ]]; then
+    BASE_DEPTH=28
+    BASE_DEVICE_BATCH=4
+    BASE_ITERS=500
+    BASE_DESC="~1.3B params (depth 28), ~65M tokens (~same FLOPs as depth-12 run)"
+fi
+
+echo "Config[$GPU_TYPE]: depth=$BASE_DEPTH, device_batch=$BASE_DEVICE_BATCH, total_batch=$BASE_TOTAL_BATCH, iters=$BASE_ITERS"
+echo "Base profile: $BASE_DESC"
 
 python -m scripts.base_train \
     --depth=$BASE_DEPTH \
@@ -100,7 +140,12 @@ python -m scripts.mid_train \
     --eval_tokens=$BASE_EVAL_TOKENS \
     --run=$WANDB_RUN
 
-python -m scripts.chat_eval -i mid -x 96 -m 256 -t 0.0
+MID_CKPT_DIR="$NANOCHAT_BASE_DIR/mid_checkpoints/d$BASE_DEPTH"
+if [[ -d "$MID_CKPT_DIR" ]]; then
+    python -m scripts.chat_eval -i mid -x 96 -m 256 -t 0.0
+else
+    echo "Skipping mid chat_eval: $MID_CKPT_DIR not found"
+fi
 
 # -----------------------------------------------------------------------------
 # Supervised finetuning (short pass over curated dialogs)
@@ -113,7 +158,12 @@ python -m scripts.chat_sft \
     --eval_metrics_max_problems=96 \
     --run=$WANDB_RUN
 
-python -m scripts.chat_eval -i sft -x 96 -m 256 -t 0.0
+SFT_CKPT_DIR="$NANOCHAT_BASE_DIR/chatsft_checkpoints/d$BASE_DEPTH"
+if [[ -d "$SFT_CKPT_DIR" ]]; then
+    python -m scripts.chat_eval -i sft -x 96 -m 256 -t 0.0
+else
+    echo "Skipping sft chat_eval: $SFT_CKPT_DIR not found"
+fi
 
 # -----------------------------------------------------------------------------
 # Report + optional chat endpoints
