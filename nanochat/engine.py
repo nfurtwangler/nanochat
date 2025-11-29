@@ -20,6 +20,7 @@ from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from contextlib import nullcontext 
+from nanochat.partial_collapse import partial_collapse_step
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -191,12 +192,15 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
+        embedding_weight = self.model.transformer.wte.weight
+        pending_inputs_embeds = None
+        last_probs = None
 
         # Get the special tokens we need to coordinate the tool use state machine
         get_special = lambda s: self.tokenizer.encode_special(s)
@@ -218,7 +222,10 @@ class Engine:
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :]
-        next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+        if partial_collapse:
+            last_probs = torch.softmax(logits, dim=-1)
+        sampling_logits = logits.clone()
+        next_ids = sample_next_token(sampling_logits, rng, temperature, top_k)  # (B, 1)
         sampled_tokens = next_ids[:, 0].tolist()
 
         # 2) Replicate the KV cache for each sample/row
@@ -233,6 +240,8 @@ class Engine:
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+        if partial_collapse and last_probs is not None and num_samples > 1:
+            last_probs = last_probs.repeat(num_samples, 1)
 
         # 4) Main generation loop
         num_generated = 0
@@ -253,9 +262,15 @@ class Engine:
                 first_iteration = False
             else:
                 # Forward the model and get the next token for each row
-                logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
+                if partial_collapse and pending_inputs_embeds is not None:
+                    logits = self.model.forward(idx=None, inputs_embeds=pending_inputs_embeds, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
+                else:
+                    logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
                 logits = logits[:, -1, :]  # (B, vocab_size) at last time step
-                next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+                sampling_logits = logits.clone()
+                if partial_collapse:
+                    last_probs = torch.softmax(logits, dim=-1)
+                next_ids = sample_next_token(sampling_logits, rng, temperature, top_k)  # (B, 1)
                 sampled_tokens = next_ids[:, 0].tolist()
 
             # Process each row: choose the next token, update state, optional tool use
@@ -294,9 +309,25 @@ class Engine:
             yield token_column, token_masks
             num_generated += 1
             # Prepare ids for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            ids_tensor = torch.tensor(token_column, dtype=torch.long, device=device)
+            ids = ids_tensor.unsqueeze(1)
+            if partial_collapse and last_probs is not None:
+                mix = partial_collapse_step(
+                    last_probs,
+                    ids_tensor,
+                    embedding_weight,
+                    partial_collapse_alpha,
+                    partial_collapse_top_k,
+                )
+                if any(mask == 0 for mask in token_masks):
+                    mask_tensor = torch.tensor(token_masks, dtype=torch.bool, device=device).unsqueeze(-1)
+                    base_embed = F.embedding(ids_tensor, embedding_weight)
+                    mix = torch.where(mask_tensor, mix, base_embed)
+                pending_inputs_embeds = mix.unsqueeze(1)
+            else:
+                pending_inputs_embeds = None
 
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
+    def generate_batch(self, tokens, num_samples=1, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
@@ -307,7 +338,14 @@ class Engine:
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+        for token_column, token_masks in self.generate(
+            tokens,
+            num_samples,
+            partial_collapse=partial_collapse,
+            partial_collapse_alpha=partial_collapse_alpha,
+            partial_collapse_top_k=partial_collapse_top_k,
+            **kwargs,
+        ):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
                     if token == assistant_end or token == bos:

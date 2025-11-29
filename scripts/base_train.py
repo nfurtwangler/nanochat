@@ -28,6 +28,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.partial_collapse import build_sequence_partial_collapse
 from scripts.base_eval import evaluate_model
 print_banner()
 
@@ -64,11 +65,17 @@ sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+# Partial collapse (optional dual-pass training)
+partial_collapse = 0 # set to 1 to enable partial collapse dual-pass training
+partial_collapse_alpha = 0.9
+partial_collapse_top_k = 32
+partial_collapse_lambda = 0.2
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
 user_config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+use_partial_collapse = partial_collapse != 0
 
 # Compute init
 device_type = autodetect_device_type() if device_type == "" else device_type
@@ -156,6 +163,8 @@ total_tokens = total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}") # Chinchilla is ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+if use_partial_collapse:
+    print0(f"Partial collapse enabled with alpha={partial_collapse_alpha}, top_k={partial_collapse_top_k}, lambda={partial_collapse_lambda}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
@@ -210,6 +219,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+last_partial_stats = None
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -265,10 +275,17 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        sample_kwargs = {"num_samples": 1, "max_tokens": 16, "temperature": 0}
+        if use_partial_collapse:
+            sample_kwargs.update({
+                "partial_collapse": True,
+                "partial_collapse_alpha": partial_collapse_alpha,
+                "partial_collapse_top_k": partial_collapse_top_k,
+            })
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with autocast_ctx:
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                sample, _ = engine.generate_batch(tokens, **sample_kwargs)
             print0(tokenizer.decode(sample[0]))
         model.train()
 
@@ -307,7 +324,25 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            if use_partial_collapse:
+                hard_loss, hard_logits = model(x, y, return_logits=True)
+                probs = torch.softmax(hard_logits, dim=-1)
+                mixed_inputs = build_sequence_partial_collapse(
+                    probs.detach(),
+                    x,
+                    orig_model.transformer.wte.weight,
+                    partial_collapse_alpha,
+                    partial_collapse_top_k,
+                )
+                pc_loss = model(idx=None, targets=y, inputs_embeds=mixed_inputs)
+                loss = hard_loss + partial_collapse_lambda * pc_loss
+                last_partial_stats = {
+                    "hard": hard_loss.detach(),
+                    "pc": pc_loss.detach(),
+                }
+            else:
+                loss = model(x, y)
+                last_partial_stats = None
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -357,6 +392,9 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
         }
+        if use_partial_collapse and last_partial_stats is not None:
+            log_data["train/loss_hard"] = last_partial_stats["hard"].item()
+            log_data["train/loss_partial"] = last_partial_stats["pc"].item()
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
         wandb_run.log(log_data)

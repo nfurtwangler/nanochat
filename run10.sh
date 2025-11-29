@@ -8,6 +8,7 @@ set -euo pipefail
 # Budget target: ~12 hours of uninterrupted run time on the chosen GPU (~$10).
 
 GPU_TYPE="a100"
+PARTIAL_COLLAPSE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpu=*)
@@ -22,6 +23,18 @@ while [[ $# -gt 0 ]]; do
             GPU_TYPE="$2"
             shift 2
             ;;
+        --partialCollapse=*)
+            PARTIAL_COLLAPSE="${1#*=}"
+            shift
+            ;;
+        --partialCollapse)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --partialCollapse" >&2
+                exit 1
+            fi
+            PARTIAL_COLLAPSE="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
@@ -30,6 +43,10 @@ done
 
 if [[ "$GPU_TYPE" != "a100" && "$GPU_TYPE" != "5090" ]]; then
     echo "Unsupported --gpu value: $GPU_TYPE (expected 'a100' or '5090')" >&2
+    exit 1
+fi
+if [[ "$PARTIAL_COLLAPSE" != "0" && "$PARTIAL_COLLAPSE" != "1" ]]; then
+    echo "Unsupported --partialCollapse value: $PARTIAL_COLLAPSE (expected 0 or 1)" >&2
     exit 1
 fi
 
@@ -112,6 +129,9 @@ fi
 
 echo "Config[$GPU_TYPE]: depth=$BASE_DEPTH, device_batch=$BASE_DEVICE_BATCH, total_batch=$BASE_TOTAL_BATCH, iters=$BASE_ITERS"
 echo "Base profile: $BASE_DESC"
+if [[ "$PARTIAL_COLLAPSE" == "1" ]]; then
+    echo "Partial collapse training enabled"
+fi
 
 python -m scripts.base_train \
     --depth=$BASE_DEPTH \
@@ -122,7 +142,8 @@ python -m scripts.base_train \
     --eval_tokens=$BASE_EVAL_TOKENS \
     --core_metric_every=100 \
     --sample_every=100 \
-    --run=$WANDB_RUN
+    --run=$WANDB_RUN \
+    --partial_collapse=$PARTIAL_COLLAPSE
 
 python -m scripts.base_loss \
     --device_batch_size=$BASE_DEVICE_BATCH \

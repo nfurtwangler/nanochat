@@ -241,19 +241,29 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
+    def forward(self, idx=None, targets=None, kv_cache=None, loss_reduction='mean', inputs_embeds=None, return_logits=False):
+        assert idx is not None or inputs_embeds is not None, "Either idx or inputs_embeds must be provided"
+        if inputs_embeds is not None:
+            x = inputs_embeds
+            B, T, _ = x.size()
+            device = x.device
+        else:
+            B, T = idx.size()
+            device = idx.device
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert device == self.cos.device, f"Rotary embeddings and inputs are on different devices: {device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx)
+        if inputs_embeds is None:
+            x = self.transformer.wte(idx)
+        else:
+            x = inputs_embeds
         x = norm(x)
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
@@ -261,18 +271,18 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15
+        logits = self.lm_head(x)
+        logits = softcap * torch.tanh(logits / softcap) # logits softcap
+        logits = logits.float() # use tf32/fp32 for logits
         if targets is not None:
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
-            logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_logits:
+                return loss, logits
             return loss
         else:
             # inference mode: compute and return the logits
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
             return logits
 
     @torch.inference_mode()
