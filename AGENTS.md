@@ -7,3 +7,5 @@ docs/partial_collapse_prd.md contains a PRD describing the idea of using top-K "
 docs/partial_collapse_tdd.md describes a technical approach on how to break the problem down and implement it.
 
 Ultimately we will want the partial_collapse mode to be a flag we can pass into the run10.sh script such that we can train the base model WITHOUT using partial collapse (train as is in normal nanochat scripts).  Ideally this flag would just be used at certain points in the scripts to do the special partial collapse based training when it is specified and most of the code would be the same for base training vs partial_collapse training if possible.
+
+As of a recent commit, the --partialCollapse path has been implemented with dual pass training step.  It runs, but had some initial memory issues and was causing OOMs.  It still sits at about +16% extra memory usage and is 2x slower than the normal path.  We will be looking at ways to keep additional memory usage down and not require a full 2x slowdown next if possible.
