@@ -120,8 +120,8 @@ python -m scripts.base_train \
     --num_iterations=$BASE_ITERS \
     --eval_every=200 \
     --eval_tokens=$BASE_EVAL_TOKENS \
-    --core_metric_every=-1 \
-    --sample_every=-1 \
+    --core_metric_every=100 \
+    --sample_every=100 \
     --run=$WANDB_RUN
 
 python -m scripts.base_loss \
