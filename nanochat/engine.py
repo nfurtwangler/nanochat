@@ -20,7 +20,7 @@ from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
 from contextlib import nullcontext 
-from nanochat.partial_collapse import partial_collapse_step
+from nanochat.partial_collapse import partial_collapse_step, topk_expected_embedding
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -200,7 +200,7 @@ class Engine:
         rng.manual_seed(seed)
         embedding_weight = self.model.transformer.wte.weight
         pending_inputs_embeds = None
-        last_probs = None
+        last_soft = None
 
         # Get the special tokens we need to coordinate the tool use state machine
         get_special = lambda s: self.tokenizer.encode_special(s)
@@ -223,7 +223,7 @@ class Engine:
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :]
         if partial_collapse:
-            last_probs = torch.softmax(logits, dim=-1)
+            last_soft = topk_expected_embedding(logits, embedding_weight, partial_collapse_top_k)
         sampling_logits = logits.clone()
         next_ids = sample_next_token(sampling_logits, rng, temperature, top_k)  # (B, 1)
         sampled_tokens = next_ids[:, 0].tolist()
@@ -240,8 +240,8 @@ class Engine:
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
-        if partial_collapse and last_probs is not None and num_samples > 1:
-            last_probs = last_probs.repeat(num_samples, 1)
+        if partial_collapse and last_soft is not None and num_samples > 1:
+            last_soft = last_soft.repeat(num_samples, 1)
 
         # 4) Main generation loop
         num_generated = 0
@@ -269,7 +269,7 @@ class Engine:
                 logits = logits[:, -1, :]  # (B, vocab_size) at last time step
                 sampling_logits = logits.clone()
                 if partial_collapse:
-                    last_probs = torch.softmax(logits, dim=-1)
+                    last_soft = topk_expected_embedding(logits, embedding_weight, partial_collapse_top_k)
                 next_ids = sample_next_token(sampling_logits, rng, temperature, top_k)  # (B, 1)
                 sampled_tokens = next_ids[:, 0].tolist()
 
@@ -311,13 +311,12 @@ class Engine:
             # Prepare ids for next iteration
             ids_tensor = torch.tensor(token_column, dtype=torch.long, device=device)
             ids = ids_tensor.unsqueeze(1)
-            if partial_collapse and last_probs is not None:
+            if partial_collapse and last_soft is not None:
                 mix = partial_collapse_step(
-                    last_probs,
+                    last_soft,
                     ids_tensor,
                     embedding_weight,
                     partial_collapse_alpha,
-                    partial_collapse_top_k,
                 )
                 if any(mask == 0 for mask in token_masks):
                     mask_tensor = torch.tensor(token_masks, dtype=torch.bool, device=device).unsqueeze(-1)

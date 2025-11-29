@@ -323,29 +323,39 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            if use_partial_collapse:
-                hard_loss, hard_logits = model(x, y, return_logits=True)
-                probs = torch.softmax(hard_logits, dim=-1)
-                mixed_inputs = build_sequence_partial_collapse(
-                    probs.detach(),
-                    x,
-                    orig_model.transformer.wte.weight,
-                    partial_collapse_alpha,
-                    partial_collapse_top_k,
-                )
+        if use_partial_collapse:
+            with autocast_ctx:
+                hard_loss = model(x, y)
+            hard_loss_scaled = hard_loss / grad_accum_steps
+            hard_loss_scaled.backward()
+            with torch.no_grad():
+                with autocast_ctx:
+                    logits_for_pc = orig_model(idx=x)
+            mixed_inputs = build_sequence_partial_collapse(
+                logits_for_pc,
+                x,
+                orig_model.transformer.wte.weight,
+                partial_collapse_alpha,
+                partial_collapse_top_k,
+            )
+            del logits_for_pc
+            with autocast_ctx:
                 pc_loss = model(idx=None, targets=y, inputs_embeds=mixed_inputs)
-                loss = hard_loss + partial_collapse_lambda * pc_loss
-                last_partial_stats = {
-                    "hard": hard_loss.detach(),
-                    "pc": pc_loss.detach(),
-                }
-            else:
+            pc_contrib = partial_collapse_lambda * pc_loss
+            pc_contrib_scaled = pc_contrib / grad_accum_steps
+            pc_contrib_scaled.backward()
+            train_loss = (hard_loss + pc_contrib).detach() # for logging
+            last_partial_stats = {
+                "hard": hard_loss.detach(),
+                "pc": pc_loss.detach(),
+            }
+        else:
+            with autocast_ctx:
                 loss = model(x, y)
-                last_partial_stats = None
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
+            train_loss = loss.detach() # for logging
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            loss.backward()
+            last_partial_stats = None
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # gradient clipping
     grad_clip_enabled = grad_clip > 0.0
