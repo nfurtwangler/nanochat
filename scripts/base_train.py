@@ -220,6 +220,7 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 last_partial_stats = None
+recent_step_times = []
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -391,6 +392,15 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    recent_step_times.append(dt)
+    if len(recent_step_times) > 5:
+        recent_step_times.pop(0)
+    if step % 5 == 0:
+        avg_dt = sum(recent_step_times) / len(recent_step_times)
+        wandb_run.log({
+            "step": step,
+            "train/dt_avg_5": avg_dt,
+        })
     if step % 20 == 0:
         log_data = {
             "step": step,
