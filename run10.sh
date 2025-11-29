@@ -95,18 +95,17 @@ fi
 # -----------------------------------------------------------------------------
 # Base model (scales depth/iterations per GPU target)
 
-BASE_DEPTH=12
-BASE_DEVICE_BATCH=8
-BASE_TOTAL_BATCH=131072
-BASE_ITERS=4000
-BASE_EVAL_TOKENS=262144
-BASE_DESC="~260M params (depth 12), ~520M tokens"
+BASE_DEPTH=28
+BASE_DEVICE_BATCH=12
+BASE_TOTAL_BATCH=196608
+BASE_ITERS=2000
+BASE_EVAL_TOKENS=393216
+BASE_DESC="~1.1B params (depth 28), ~394M tokens"
 
 if [[ "$GPU_TYPE" == "5090" ]]; then
     BASE_DEPTH=28
     BASE_DEVICE_BATCH=3
     BASE_TOTAL_BATCH=129024
-    BASE_ITERS=500
     BASE_EVAL_TOKENS=294912
     BASE_DESC="~1.3B params (depth 28), ~65M tokens (~same FLOPs as depth-12 run)"
 fi
