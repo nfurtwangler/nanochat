@@ -5,8 +5,10 @@ import math
 import torch
 import torch.distributed as dist
 
+from nanochat.partial_collapse import build_sequence_partial_collapse
+
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(model, batches, steps, token_bytes, *, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -30,7 +32,19 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        if partial_collapse:
+            hard_loss2d, hard_logits = model(x, y, loss_reduction='none', return_logits=True)
+            probs = torch.softmax(hard_logits, dim=-1)
+            mixed_inputs = build_sequence_partial_collapse(
+                probs.detach(),
+                x,
+                model.transformer.wte.weight,
+                partial_collapse_alpha,
+                partial_collapse_top_k,
+            )
+            loss2d = model(idx=None, targets=y, inputs_embeds=mixed_inputs, loss_reduction='none')
+        else:
+            loss2d = model(x, y, loss_reduction='none') # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

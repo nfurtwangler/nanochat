@@ -9,6 +9,8 @@ set -euo pipefail
 
 GPU_TYPE="a100"
 PARTIAL_COLLAPSE=0
+PARTIAL_COLLAPSE_ALPHA="0.9"
+PARTIAL_COLLAPSE_TOPK="32"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpu=*)
@@ -35,6 +37,30 @@ while [[ $# -gt 0 ]]; do
             PARTIAL_COLLAPSE="$2"
             shift 2
             ;;
+        --partialCollapseAlpha=*)
+            PARTIAL_COLLAPSE_ALPHA="${1#*=}"
+            shift
+            ;;
+        --partialCollapseAlpha)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --partialCollapseAlpha" >&2
+                exit 1
+            fi
+            PARTIAL_COLLAPSE_ALPHA="$2"
+            shift 2
+            ;;
+        --partialCollapseTopK=*)
+            PARTIAL_COLLAPSE_TOPK="${1#*=}"
+            shift
+            ;;
+        --partialCollapseTopK)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --partialCollapseTopK" >&2
+                exit 1
+            fi
+            PARTIAL_COLLAPSE_TOPK="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
@@ -47,6 +73,14 @@ if [[ "$GPU_TYPE" != "a100" && "$GPU_TYPE" != "5090" ]]; then
 fi
 if [[ "$PARTIAL_COLLAPSE" != "0" && "$PARTIAL_COLLAPSE" != "1" ]]; then
     echo "Unsupported --partialCollapse value: $PARTIAL_COLLAPSE (expected 0 or 1)" >&2
+    exit 1
+fi
+if ! [[ "$PARTIAL_COLLAPSE_ALPHA" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+    echo "Unsupported --partialCollapseAlpha value: $PARTIAL_COLLAPSE_ALPHA" >&2
+    exit 1
+fi
+if ! [[ "$PARTIAL_COLLAPSE_TOPK" =~ ^[0-9]+$ ]]; then
+    echo "Unsupported --partialCollapseTopK value: $PARTIAL_COLLAPSE_TOPK" >&2
     exit 1
 fi
 
@@ -130,7 +164,7 @@ fi
 echo "Config[$GPU_TYPE]: depth=$BASE_DEPTH, device_batch=$BASE_DEVICE_BATCH, total_batch=$BASE_TOTAL_BATCH, iters=$BASE_ITERS"
 echo "Base profile: $BASE_DESC"
 if [[ "$PARTIAL_COLLAPSE" == "1" ]]; then
-    echo "Partial collapse training enabled"
+    echo "Partial collapse training enabled (alpha=$PARTIAL_COLLAPSE_ALPHA, top_k=$PARTIAL_COLLAPSE_TOPK)"
 fi
 
 python -m scripts.base_train \
@@ -143,13 +177,22 @@ python -m scripts.base_train \
     --core_metric_every=100 \
     --sample_every=100 \
     --run=$WANDB_RUN \
-    --partial_collapse=$PARTIAL_COLLAPSE
+    --partial_collapse=$PARTIAL_COLLAPSE \
+    --partial_collapse_alpha=$PARTIAL_COLLAPSE_ALPHA \
+    --partial_collapse_top_k=$PARTIAL_COLLAPSE_TOPK
 
 python -m scripts.base_loss \
     --device_batch_size=$BASE_DEVICE_BATCH \
-    --split_tokens=$BASE_EVAL_TOKENS
+    --split_tokens=$BASE_EVAL_TOKENS \
+    --partial_collapse=$PARTIAL_COLLAPSE \
+    --partial_collapse_alpha=$PARTIAL_COLLAPSE_ALPHA \
+    --partial_collapse_top_k=$PARTIAL_COLLAPSE_TOPK
 
-python -m scripts.base_eval --max-per-task=96
+python -m scripts.base_eval \
+    --max-per-task=96 \
+    --partial-collapse=$PARTIAL_COLLAPSE \
+    --partial-collapse-alpha=$PARTIAL_COLLAPSE_ALPHA \
+    --partial-collapse-top-k=$PARTIAL_COLLAPSE_TOPK
 
 # -----------------------------------------------------------------------------
 # Midtraining (lightweight conversation/tool warm-up)

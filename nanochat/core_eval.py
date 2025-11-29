@@ -11,6 +11,8 @@ from jinja2 import Template
 import torch
 import torch.distributed as dist
 
+from nanochat.partial_collapse import build_sequence_partial_collapse
+
 # -----------------------------------------------------------------------------
 # Prompt rendering utilities
 
@@ -142,30 +144,53 @@ def batch_sequences_lm(tokenizer, prompts):
 
 
 @torch.no_grad()
-def forward_model(model, input_ids):
+def forward_model(model, input_ids, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
-    # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
-    losses = torch.nn.functional.cross_entropy(
-        outputs.view(batch_size * seq_len, -1),
-        target_ids.view(batch_size * seq_len),
-        reduction='none'
-    ).view(batch_size, seq_len)
-    # Set the last column to be nan because there is no autoregressive loss there
+    if partial_collapse:
+        if not hasattr(model, "transformer") or not hasattr(model.transformer, "wte"):
+            raise ValueError("Partial collapse CORE eval requires a GPT model with token embeddings")
+        hard_loss_flat, hard_logits = model(
+            input_ids,
+            targets=target_ids,
+            loss_reduction='none',
+            return_logits=True,
+        )
+        hard_logits = hard_logits.view(batch_size, seq_len, -1)
+        probs = torch.softmax(hard_logits.detach(), dim=-1)
+        mixed_inputs = build_sequence_partial_collapse(
+            probs,
+            input_ids,
+            model.transformer.wte.weight,
+            partial_collapse_alpha,
+            partial_collapse_top_k,
+        )
+        loss_flat, logits = model(
+            idx=None,
+            targets=target_ids,
+            inputs_embeds=mixed_inputs,
+            loss_reduction='none',
+            return_logits=True,
+        )
+        losses = loss_flat.view(batch_size, seq_len)
+    else:
+        logits = model(input_ids)
+        losses = torch.nn.functional.cross_entropy(
+            logits.view(batch_size * seq_len, -1),
+            target_ids.view(batch_size * seq_len),
+            reduction='none'
+        ).view(batch_size, seq_len)
     losses[:, -1] = float('nan')
-    # Get the argmax predictions at each position
-    predictions = outputs.argmax(dim=-1)
+    predictions = logits.argmax(dim=-1)
     return losses, predictions
 
 
 @torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
+def evaluate_example(idx, model, tokenizer, data, device, task_meta, *, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32):
     """Evaluate a single example, return True if correct, False otherwise"""
     item = data[idx]
     task_type = task_meta['task_type']
@@ -218,7 +243,13 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
+    losses, predictions = forward_model(
+        model,
+        input_ids,
+        partial_collapse=partial_collapse,
+        partial_collapse_alpha=partial_collapse_alpha,
+        partial_collapse_top_k=partial_collapse_top_k,
+    )
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
@@ -241,7 +272,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, *, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
@@ -251,7 +282,17 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+        is_correct = evaluate_example(
+            idx,
+            model,
+            tokenizer,
+            data,
+            device,
+            task_meta,
+            partial_collapse=partial_collapse,
+            partial_collapse_alpha=partial_collapse_alpha,
+            partial_collapse_top_k=partial_collapse_top_k,
+        )
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
     if world_size > 1:

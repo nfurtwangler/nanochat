@@ -45,7 +45,7 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_model(model, tokenizer, device, max_per_task=-1):
+def evaluate_model(model, tokenizer, device, max_per_task=-1, *, partial_collapse=False, partial_collapse_alpha=0.9, partial_collapse_top_k=32):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
@@ -99,7 +99,16 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
             data = data[:max_per_task]
 
         # run the evaluation for this task
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(
+            model,
+            tokenizer,
+            data,
+            device,
+            task_meta,
+            partial_collapse=partial_collapse,
+            partial_collapse_alpha=partial_collapse_alpha,
+            partial_collapse_top_k=partial_collapse_top_k,
+        )
 
         results[label] = accuracy
         random_baseline = random_baselines[label]
@@ -149,6 +158,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
+    parser.add_argument('--partial-collapse', type=int, default=0, help='Enable partial collapse evaluation (1=on, 0=off)')
+    parser.add_argument('--partial-collapse-alpha', type=float, default=0.9, help='Alpha for partial collapse eval')
+    parser.add_argument('--partial-collapse-top-k', type=int, default=32, help='Top-K for partial collapse eval')
     args = parser.parse_args()
 
     # distributed / precision setup
@@ -157,7 +169,11 @@ def main():
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
     # Load model and tokenizer from command line or from file system
+    use_partial = args.partial_collapse != 0
+
     if args.hf_path is not None:
+        if use_partial:
+            raise ValueError("Partial collapse eval is not supported for HuggingFace models")
         # atm assume that if a path is given, it's a huggingface model path
         hf_path = args.hf_path
         print0(f"Loading huggingface model from: {hf_path}")
@@ -172,7 +188,15 @@ def main():
 
     # Evaluate the model
     with autocast_ctx:
-        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task)
+        out = evaluate_model(
+            model,
+            tokenizer,
+            device,
+            max_per_task=args.max_per_task,
+            partial_collapse=use_partial,
+            partial_collapse_alpha=args.partial_collapse_alpha,
+            partial_collapse_top_k=args.partial_collapse_top_k,
+        )
 
     # Write out the results to a csv file
     core_metric = None

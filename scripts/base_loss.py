@@ -22,7 +22,11 @@ split_tokens = 20*524288  # number of tokens to evaluate per split
 model_tag = None # optional model tag for the output directory name
 model_step = None # optional model step for the output directory name
 device_type = "" # cuda|cpu|mps (empty => autodetect)
+partial_collapse = 0 # matches training flag
+partial_collapse_alpha = 0.9
+partial_collapse_top_k = 32
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
+use_partial_collapse = partial_collapse != 0
 
 # Load the base model and the tokenizer
 device_type = autodetect_device_type() if device_type == "" else device_type
@@ -40,7 +44,15 @@ bpb_results = {}
 for split_name in ["train", "val"]:
     loader = tokenizing_distributed_data_loader(device_batch_size, sequence_len, split_name, device=device)
     with autocast_ctx:
-        bpb = evaluate_bpb(model, loader, steps, token_bytes)
+        bpb = evaluate_bpb(
+            model,
+            loader,
+            steps,
+            token_bytes,
+            partial_collapse=use_partial_collapse,
+            partial_collapse_alpha=partial_collapse_alpha,
+            partial_collapse_top_k=partial_collapse_top_k,
+        )
     print0(f"{split_name} bpb: {bpb:.4f}")
     bpb_results[split_name] = bpb
 
@@ -57,10 +69,17 @@ if ddp_rank == 0:
         "If 5*x + 3 = 13, then x is",
     ]
     engine = Engine(model, tokenizer)
+    sample_kwargs = {"num_samples": 1, "max_tokens": 16, "temperature": 0}
+    if use_partial_collapse:
+        sample_kwargs.update({
+            "partial_collapse": True,
+            "partial_collapse_alpha": partial_collapse_alpha,
+            "partial_collapse_top_k": partial_collapse_top_k,
+        })
     for prompt in prompts:
         tokens = tokenizer(prompt, prepend="<|bos|>")
         with autocast_ctx:
-            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            sample, _ = engine.generate_batch(tokens, **sample_kwargs)
         sample_str = tokenizer.decode(sample[0])
         print0(sample_str)
         samples.append(sample_str)
