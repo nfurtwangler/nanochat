@@ -241,7 +241,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx=None, targets=None, kv_cache=None, loss_reduction='mean', inputs_embeds=None):
+    def forward(self, idx=None, targets=None, kv_cache=None, loss_reduction='mean', inputs_embeds=None, return_logits=False):
         assert idx is not None or inputs_embeds is not None, "Either idx or inputs_embeds must be provided"
         if inputs_embeds is not None:
             x = inputs_embeds
@@ -278,6 +278,8 @@ class GPT(nn.Module):
             # training mode: compute and return the loss
             # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_logits:
+                return loss, logits
             return loss
         else:
             # inference mode: compute and return the logits
