@@ -229,60 +229,10 @@ Copy code
 
 ---
 
-# 7. Tests (TDD Requirements)
+# 7. Tests
 
-## 7.1 Unit Tests
-
-### U1: Top‑k Extraction
-- Input: p = [0.5, 0.3, 0.2], k=2  
-- Expected: indices [0,1], probs renormalized to [0.625, 0.375]
-
-### U2: Partial Collapse Correctness
-Given:
-- E tokens = one-hot in 2D:  
-  E0 = [1,0], E1=[0,1]
-- sampled k = 0  
-- top‑k = [0,1]  
-- p = [0.6,0.4]  
-- α = 0.75  
-
-Expected:
-x = 0.75*[1,0] + 0.25*(0.6*[1,0] + 0.4*[0,1])
-= [0.75 + 0.15, 0 + 0.1]
-= [0.9, 0.1]
-
-yaml
-Copy code
-
-### U3: Stop‑Gradient Check
-- Ensure Pass 2 backprop does not update Pass 1 graph.
-
-### U4: Batch Behavior
-- Input batches `[B, T]` must produce:
-  - probabilities `[B, T, V]`
-  - mixed embeddings `[B, T, d]`
-
-### U5: Deterministic Sampling
-- Fix seed → identical sequences.
-
----
-
-## 7.2 Integration Tests
-
-### I1: End-to-End Dual-Pass
-- Build a tiny transformer (d=16, vocab=50)
-- Train 50 steps
-- Assert:
-  - loss decreases
-  - L_hard and L_pc are logged separately
-
-### I2: Inference Stability
-- Generate long sequences (≥ 1024 tokens)
-- Confirm:
-  - no numerical instability  
-  - embeddings stay normalized within expected range
-
----
+See `docs/partial_collapse_test_plan.md` for the current unit, integration, and
+CLI verification plan.
 
 # 8. Performance Targets
 
